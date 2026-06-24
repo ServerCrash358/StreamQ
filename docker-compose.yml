@@ -1,0 +1,31 @@
+# Local dev infra for streamq. Ports offset to avoid other projects:
+#   Postgres → 5436   Redis → 6381
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: streamq
+      POSTGRES_PASSWORD: streamq
+      POSTGRES_DB: streamq
+    ports: ["5436:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamq"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes   # persist the streams across restarts
+    ports: ["6381:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
