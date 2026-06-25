@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streamq-config
+  namespace: streamq
+data:
+  REDIS_URL: "redis://redis:6379/0"
+  MAX_RETRIES: "3"
+  WORKER_CONCURRENCY: "4"
+  RATE_LIMIT_PER_WINDOW: "100"
+  RATE_LIMIT_WINDOW_SECONDS: "60"
+  METRICS_PORT: "9100"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: streamq-secret
+  namespace: streamq
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://streamq:streamq@postgres:5432/streamq"

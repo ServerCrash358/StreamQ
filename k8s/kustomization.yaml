@@ -1,0 +1,11 @@
+# kubectl apply -k k8s/   (KEDA must be installed first for the ScaledObject)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: streamq
+resources:
+  - namespace.yaml
+  - config.yaml
+  - postgres.yaml
+  - redis.yaml
+  - worker.yaml
+  - keda-scaledobject.yaml

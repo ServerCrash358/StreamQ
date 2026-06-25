@@ -1,0 +1,43 @@
+# Workers as a StatefulSet: each pod gets a STABLE name (streamq-worker-0, -1, …),
+# which becomes a stable Redis Streams consumer identity — so a restarted pod
+# owns the same pending entries and reclaim stays clean. KEDA drives the replica
+# count (see keda-scaledobject.yaml), so `replicas` here is just the starting point.
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamq-worker
+  namespace: streamq
+  labels: { app: streamq-worker }
+spec:
+  clusterIP: None            # headless — required by the StatefulSet
+  selector: { app: streamq-worker }
+  ports: [{ name: metrics, port: 9100, targetPort: 9100 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: streamq-worker
+  namespace: streamq
+spec:
+  serviceName: streamq-worker
+  replicas: 1
+  selector: { matchLabels: { app: streamq-worker } }
+  template:
+    metadata:
+      labels: { app: streamq-worker }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: worker
+          image: streamq-worker:latest
+          imagePullPolicy: IfNotPresent   # kind load this image locally
+          envFrom:
+            - configMapRef: { name: streamq-config }
+            - secretRef: { name: streamq-secret }
+          ports: [{ name: metrics, containerPort: 9100 }]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }

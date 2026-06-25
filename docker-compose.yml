@@ -27,5 +27,16 @@ services:
       timeout: 3s
       retries: 10
 
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://streamq:streamq@db:5432/streamq
+      REDIS_URL: redis://redis:6379/0
+    ports: ["9100:9100"]      # Prometheus /metrics
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # One worker locally; horizontal scaling is KEDA's job in k8s (see k8s/).
+
 volumes:
   pgdata:

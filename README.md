@@ -6,9 +6,11 @@ fan-out), and **PostgreSQL** for durable job state. Built for at-least-once
 delivery, retry with exponential backoff, a dead-letter queue, per-tenant rate
 limiting, and **KEDA**-driven autoscaling on queue depth.
 
-> **Status: Step 4 of 6 complete** — reliable distributed queue with retry/DLQ,
-> crash recovery, and **per-tenant rate limiting** (over-quota tasks are deferred,
-> not failed). Tested. Plan below.
+> **Status: COMPLETE (all 6 steps).** A production-style distributed task queue:
+> Redis Streams + asyncio workers + Postgres durability, at-least-once delivery,
+> retry/backoff/DLQ, crash recovery, per-tenant rate limiting, containerised,
+> Kubernetes (StatefulSet) with **KEDA** autoscaling on queue depth, and
+> Prometheus metrics.
 
 ## Why these pieces (the architecture)
 
@@ -38,8 +40,8 @@ producer ──XADD──▶ Redis Stream "streamq:tasks"
 | 2 | Core: Redis Streams broker + asyncio worker pool + job state | ✅ done |
 | 3 | Reliability: at-least-once (ACK + reclaim), retry+backoff+jitter, DLQ | ✅ done |
 | 4 | Per-tenant rate limiting + tests | ✅ done |
-| 5 | Docker + Kubernetes + KEDA autoscaling on queue depth | ⬜ |
-| 6 | Prometheus metrics (queue depth, latency by task, retry rate, DLQ size) | ⬜ |
+| 5 | Docker + Kubernetes (StatefulSet) + KEDA autoscaling on queue depth | ✅ done |
+| 6 | Prometheus metrics (queue depth, latency by task, retry rate, DLQ size) | ✅ done |
 
 ## Run the infra (Step 1)
 
@@ -68,11 +70,31 @@ streamq/
   scheduler.py     # pumps due delayed-retries back onto the stream
   reclaimer.py     # XAUTOCLAIM: recovers messages orphaned by crashed workers
   ratelimit.py     # per-tenant sliding-window limiter (Redis ZSET + Lua)
+  metrics.py       # Prometheus counters/gauges/histograms + /metrics server
   tasks_example.py # demo handlers (add, slow_echo, boom)
 migrations/001_init.sql   # jobs table + job_status enum + indexes
-docker-compose.yml        # postgres + redis
+Dockerfile  docker-compose.yml   # worker image + local stack (db, redis, worker)
+k8s/               # namespace, postgres, redis, worker StatefulSet, KEDA ScaledObject
 tests/             # backoff (unit) + rate limiter (integration)
 ```
+
+## Deploy to Kubernetes (Step 5)
+```bash
+# Build + load the worker image into your cluster (e.g. kind):
+docker build -t streamq-worker:latest .
+kind load docker-image streamq-worker:latest --name <cluster>
+# Install KEDA, then apply:
+helm install keda kedacore/keda -n keda --create-namespace
+kubectl apply -k k8s/
+```
+KEDA watches the consumer-group **lag** and scales the worker StatefulSet
+1→10 as the backlog grows/drains — autoscaling on queue depth, not CPU.
+
+## Metrics (Step 6)
+Each worker serves Prometheus at `:9100/metrics`:
+`streamq_queue_depth` (lag) · `streamq_pending_total` · `streamq_dlq_size` ·
+`streamq_scheduled_retries` · `streamq_task_duration_seconds` (by task) ·
+`streamq_tasks_processed_total{outcome=succeeded|failed|dead|deferred}`.
 
 ## Run a worker (Step 2)
 ```bash
