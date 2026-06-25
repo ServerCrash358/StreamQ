@@ -1,0 +1,31 @@
+# KEDA — autoscale workers on QUEUE DEPTH, not CPU. This is the whole point of
+# event-driven autoscaling: when the consumer-group lag (undelivered backlog)
+# grows, KEDA adds worker pods; when it drains, it scales back to minReplicaCount
+# (and can scale to zero). KEDA creates/manages an HPA under the hood targeting
+# the StatefulSet.
+#
+# Requires KEDA installed in the cluster:
+#   helm repo add kedacore https://kedacore.github.io/charts && helm repo update
+#   helm install keda kedacore/keda --namespace keda --create-namespace
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: streamq-worker
+  namespace: streamq
+spec:
+  scaleTargetRef:
+    kind: StatefulSet
+    name: streamq-worker
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 30        # wait 30s of low load before scaling down
+  pollingInterval: 5        # check the lag every 5s
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis.streamq.svc.cluster.local:6379
+        stream: "streamq:tasks"
+        consumerGroup: "workers"
+        # Target backlog per replica: KEDA adds pods to keep lag ≤ this.
+        lagCount: "50"
+        activationLagCount: "1"   # scale up from 0/idle as soon as 1 item waits

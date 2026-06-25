@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: streamq
+data:
+  001_init.sql: |
+    DO $$ BEGIN
+      CREATE TYPE job_status AS ENUM ('queued','running','succeeded','failed','dead');
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+    CREATE TABLE IF NOT EXISTS jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        task_name TEXT NOT NULL,
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        status job_status NOT NULL DEFAULT 'queued',
+        attempts INT NOT NULL DEFAULT 0,
+        max_retries INT NOT NULL DEFAULT 3,
+        last_error TEXT, result JSONB, stream_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs (tenant_id);
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: streamq
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: streamq
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          env:
+            - { name: POSTGRES_USER, value: streamq }
+            - { name: POSTGRES_PASSWORD, value: streamq }
+            - { name: POSTGRES_DB, value: streamq }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "streamq"] }
+            initialDelaySeconds: 5
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: postgres-data } }
+        - { name: init, configMap: { name: postgres-init } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: streamq
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]

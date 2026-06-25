@@ -17,11 +17,15 @@ import asyncio
 import json
 import os
 import socket
+import time
 import uuid
 from typing import Any
 
+import redis.exceptions
+
 from streamq.broker import Broker
 from streamq.config import get_settings
+from streamq.metrics import TASK_DURATION, TASKS_PROCESSED
 from streamq.models import JobStatus
 from streamq.ratelimit import RateLimiter
 from streamq.registry import run_handler
@@ -42,9 +46,10 @@ class Worker:
         self.redis = broker.redis
         self.pool = broker.pool
         self.s = get_settings()
-        # Unique consumer name within the group (host-pid-rand) so Redis tracks
-        # each worker's pending messages separately.
-        self.name = name or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        # Consumer name within the group. In a StatefulSet the hostname is a
+        # STABLE ordinal (streamq-worker-0), so a restarted pod reclaims its own
+        # consumer identity; pid keeps it unique if you run several locally.
+        self.name = name or f"{socket.gethostname()}-{os.getpid()}"
         self._sem = asyncio.Semaphore(self.s.worker_concurrency)
         self.limiter = RateLimiter(self.redis, self.s.rate_limit_per_window, self.s.rate_limit_window_seconds)
 
@@ -58,7 +63,8 @@ class Worker:
             await self.broker.schedule_retry(
                 fields["job_id"], fields["task"], tenant, self.s.rate_limit_defer_seconds
             )
-            await self.redis.xack(self.s.stream, self.s.group, msg_id)
+            TASKS_PROCESSED.labels(fields.get("task", "?"), "deferred").inc()
+            await self._ack(msg_id)
             return
 
         job_id = uuid.UUID(fields["job_id"])
@@ -70,7 +76,7 @@ class Worker:
                 job_id,
             )
         if row is None:   # job row vanished (shouldn't happen) — drop the message
-            await self.redis.xack(self.s.stream, self.s.group, msg_id)
+            await self._ack(msg_id)
             return
 
         task_name = row["task_name"]
@@ -79,6 +85,7 @@ class Worker:
         if isinstance(payload, str):
             payload = json.loads(payload)
 
+        start = time.perf_counter()
         try:
             result = await run_handler(task_name, payload)
             async with self.pool.acquire() as conn:
@@ -87,8 +94,10 @@ class Worker:
                     "WHERE id = $1",
                     job_id, json.dumps(_jsonable(result)),
                 )
+            TASKS_PROCESSED.labels(task_name, "succeeded").inc()
         except Exception as e:
             if attempts < max_retries:
+                TASKS_PROCESSED.labels(task_name, "failed").inc()
                 # transient failure → schedule a delayed retry (backoff + jitter)
                 delay = compute_backoff(attempts, self.s.base_backoff_seconds, self.s.max_backoff_seconds)
                 async with self.pool.acquire() as conn:
@@ -105,11 +114,19 @@ class Worker:
                         job_id, JobStatus.DEAD, str(e),
                     )
                 await self.broker.send_to_dlq(str(job_id), task_name, tenant, str(e))
+                TASKS_PROCESSED.labels(task_name, "dead").inc()
         finally:
+            TASK_DURATION.labels(task_name).observe(time.perf_counter() - start)
             # ACK the delivery. Terminal outcomes (succeeded/dead) are done; a
             # retry rides a NEW message re-enqueued by the scheduler, so acking
             # here is correct and avoids redelivery loops.
-            await self.redis.xack(self.s.stream, self.s.group, msg_id)
+            await self._ack(msg_id)
+
+    async def _ack(self, msg_id: str) -> None:
+        # ACK removes it from the pending list; XDEL removes the entry entirely so
+        # the stream doesn't grow unbounded with already-processed messages.
+        await self.redis.xack(self.s.stream, self.s.group, msg_id)
+        await self.redis.xdel(self.s.stream, msg_id)
 
     async def _guarded(self, msg_id: str, fields: dict[str, str]) -> None:
         async with self._sem:
@@ -118,9 +135,17 @@ class Worker:
     async def run(self, *, stop_when_idle: bool = False) -> None:
         s = self.s
         while True:
-            resp = await self.redis.xreadgroup(
-                s.group, self.name, {s.stream: ">"}, count=s.batch_size, block=s.block_ms
-            )
+            try:
+                resp = await self.redis.xreadgroup(
+                    s.group, self.name, {s.stream: ">"}, count=s.batch_size, block=s.block_ms
+                )
+            except (redis.exceptions.TimeoutError, asyncio.TimeoutError):
+                # A blocking read that found nothing within block_ms — benign.
+                resp = None
+            except redis.exceptions.ConnectionError:
+                # Transient Redis blip — back off briefly and retry.
+                await asyncio.sleep(1)
+                continue
             if not resp:
                 if stop_when_idle:
                     return
@@ -132,6 +157,7 @@ class Worker:
 async def main() -> None:
     # Importing the example tasks registers their handlers in the registry.
     from streamq import tasks_example  # noqa: F401
+    from streamq.metrics import collect_gauges, serve_metrics
     from streamq.reclaimer import Reclaimer
     from streamq.scheduler import Scheduler
 
@@ -139,10 +165,13 @@ async def main() -> None:
     worker = Worker(broker)
     scheduler = Scheduler(broker)   # pumps delayed retries back onto the stream
     reclaimer = Reclaimer(worker)   # recovers work orphaned by crashed workers
-    print(f"worker {worker.name} consuming group '{broker.s.group}' on '{broker.s.stream}'")
+    serve_metrics(broker.s.metrics_port)   # expose Prometheus /metrics
+    print(f"worker {worker.name} on '{broker.s.stream}' (metrics :{broker.s.metrics_port})")
     try:
-        # consume loop + scheduler + reclaimer run concurrently in one process
-        await asyncio.gather(worker.run(), scheduler.run(), reclaimer.run())
+        # consume + scheduler + reclaimer + metrics sampler, all concurrent
+        await asyncio.gather(
+            worker.run(), scheduler.run(), reclaimer.run(), collect_gauges(broker)
+        )
     finally:
         await broker.close()
 

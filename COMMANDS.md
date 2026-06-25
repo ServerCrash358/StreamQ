@@ -87,5 +87,42 @@ Tunables (env): `RATE_LIMIT_ENABLED`, `RATE_LIMIT_PER_WINDOW`,
 Verified: 4 tests pass; with limit=3, enqueuing 6 tasks for one tenant ran exactly
 3 and deferred the other 3 (status stayed `queued`, none failed).
 
+## Step 5 — Docker + Kubernetes + KEDA
+
+```bash
+# Local full stack (db + redis + worker), worker built from the Dockerfile:
+docker compose up -d --build
+curl localhost:9100/metrics            # worker's Prometheus endpoint
+
+# Kubernetes: build + load the image, install KEDA, apply manifests.
+docker build -t streamq-worker:latest .
+kind load docker-image streamq-worker:latest --name <cluster>
+helm install keda kedacore/keda -n keda --create-namespace
+kubectl apply -k k8s/
+kubectl -n streamq get scaledobject,statefulset,pods
+```
+- Workers run as a **StatefulSet** (stable pod names → stable Redis consumer
+  identities → clean reclaim).
+- **KEDA ScaledObject** scales workers on the consumer-group **lag** (queue
+  depth), min 1 → max 10. Not CPU.
+
+## Step 6 — Prometheus metrics
+
+Each worker exposes `:9100/metrics`:
+```bash
+curl localhost:9100/metrics | grep '^streamq_'
+```
+| Metric | Meaning |
+|--------|---------|
+| `streamq_queue_depth` | consumer-group lag (real backlog, not XLEN) |
+| `streamq_pending_total` | delivered-but-unacked (in-flight) |
+| `streamq_dlq_size` | dead-letter queue size |
+| `streamq_scheduled_retries` | delayed retries waiting |
+| `streamq_task_duration_seconds{task}` | processing latency histogram |
+| `streamq_tasks_processed_total{task,outcome}` | throughput / retry rate / DLQ rate |
+
+Verified: worker stays up under blocking reads; queue_depth → 0 when drained;
+counters increment per outcome; entries XDEL'd after ack so the stream stays bounded.
+
 ---
-*Log: Steps 1–4 done. Next: Step 5 — Docker + Kubernetes + KEDA autoscaling on queue depth.*
+*Log: ALL 6 STEPS DONE. streamq is a complete, production-style distributed task queue.*

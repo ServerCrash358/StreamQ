@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "info"
+    metrics_port: int = 9100           # each worker exposes Prometheus /metrics here
 
     # ── backing stores ───────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6381/0"
