@@ -6,8 +6,9 @@ fan-out), and **PostgreSQL** for durable job state. Built for at-least-once
 delivery, retry with exponential backoff, a dead-letter queue, per-tenant rate
 limiting, and **KEDA**-driven autoscaling on queue depth.
 
-> **Status: Step 2 of 6 complete** — infra + a working distributed queue
-> (enqueue → Redis Streams consumer group → asyncio workers → durable job state). Plan below.
+> **Status: Step 3 of 6 complete** — distributed queue with full reliability:
+> at-least-once delivery, retry w/ exponential backoff + jitter, dead-letter
+> queue, and crash recovery via reclaim. Plan below.
 
 ## Why these pieces (the architecture)
 
@@ -35,7 +36,7 @@ producer ──XADD──▶ Redis Stream "streamq:tasks"
 |------|------|-------|
 | 1 | Infra: Redis + Postgres, ports, durable `jobs` schema | ✅ done |
 | 2 | Core: Redis Streams broker + asyncio worker pool + job state | ✅ done |
-| 3 | Reliability: at-least-once (ACK + reclaim), retry+backoff+jitter, DLQ | ⬜ |
+| 3 | Reliability: at-least-once (ACK + reclaim), retry+backoff+jitter, DLQ | ✅ done |
 | 4 | Per-tenant rate limiting + tests | ⬜ |
 | 5 | Docker + Kubernetes + KEDA autoscaling on queue depth | ⬜ |
 | 6 | Prometheus metrics (queue depth, latency by task, retry rate, DLQ size) | ⬜ |
@@ -63,6 +64,9 @@ streamq/
   registry.py      # task name -> handler (@task decorator; sync or async)
   broker.py        # enqueue: Postgres row + XADD; consumer-group setup
   worker.py        # asyncio consumer: XREADGROUP -> run -> update state -> XACK
+  retry.py         # exponential backoff + full jitter
+  scheduler.py     # pumps due delayed-retries back onto the stream
+  reclaimer.py     # XAUTOCLAIM: recovers messages orphaned by crashed workers
   tasks_example.py # demo handlers (add, slow_echo, boom)
 migrations/001_init.sql   # jobs table + job_status enum + indexes
 docker-compose.yml        # postgres + redis

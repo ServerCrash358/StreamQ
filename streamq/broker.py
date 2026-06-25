@@ -15,6 +15,7 @@ same group, and Redis hands each message to exactly one worker.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any
 
@@ -25,12 +26,21 @@ import redis.exceptions
 from streamq.config import get_settings
 from streamq.db import create_pool
 
+# Atomically pop all due retries (score <= now) from the scheduled ZSET, so two
+# schedulers can't re-enqueue the same job. Returns the popped members.
+_POP_DUE_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+if #due > 0 then redis.call('ZREM', KEYS[1], unpack(due)) end
+return due
+"""
+
 
 class Broker:
     def __init__(self, redis: aioredis.Redis, pool: asyncpg.Pool) -> None:
         self.redis = redis
         self.pool = pool
         self.s = get_settings()
+        self._pop_due_script = redis.register_script(_POP_DUE_LUA)
 
     @classmethod
     async def create(cls) -> "Broker":
@@ -76,6 +86,26 @@ class Broker:
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE jobs SET stream_id = $1 WHERE id = $2", stream_id, job_id)
         return str(job_id)
+
+    async def reenqueue(self, job_id: str, task: str, tenant: str) -> str:
+        """Put a job back on the work stream (used by the scheduler for retries)."""
+        return await self.redis.xadd(
+            self.s.stream, {"job_id": job_id, "task": task, "tenant": tenant}
+        )
+
+    async def schedule_retry(self, job_id: str, task: str, tenant: str, delay: float) -> None:
+        """Queue a delayed retry: the scheduler re-enqueues it once `delay` elapses."""
+        member = json.dumps({"job_id": job_id, "task": task, "tenant": tenant})
+        await self.redis.zadd(self.s.scheduled_zset, {member: time.time() + delay})
+
+    async def pop_due_retries(self, limit: int = 100) -> list[str]:
+        return await self._pop_due_script(keys=[self.s.scheduled_zset], args=[time.time(), limit])
+
+    async def send_to_dlq(self, job_id: str, task: str, tenant: str, error: str) -> None:
+        await self.redis.xadd(
+            self.s.dlq_stream,
+            {"job_id": job_id, "task": task, "tenant": tenant or "default", "error": (error or "")[:1000]},
+        )
 
     async def close(self) -> None:
         await self.redis.aclose()
