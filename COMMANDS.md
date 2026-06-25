@@ -70,5 +70,22 @@ orphaned (pending) message → reclaimed → reprocessed → succeeded.
 > Note: because tasks can run more than once (retries + reclaim), **handlers
 > must be idempotent.**
 
+## Step 4 — per-tenant rate limiting + tests
+
+A worker checks the tenant's quota BEFORE running a task. Over-quota → the task
+is **deferred** (rescheduled, no retry consumed), so one tenant can't starve the rest.
+
+```bash
+uv run pytest tests/ -v        # backoff (unit) + limiter allows-then-blocks (integration)
+
+# Inspect a tenant's current window usage:
+docker exec streamq-redis-1 redis-cli ZCARD streamq:ratelimit:acme
+```
+Tunables (env): `RATE_LIMIT_ENABLED`, `RATE_LIMIT_PER_WINDOW`,
+`RATE_LIMIT_WINDOW_SECONDS`, `RATE_LIMIT_DEFER_SECONDS`.
+
+Verified: 4 tests pass; with limit=3, enqueuing 6 tasks for one tenant ran exactly
+3 and deferred the other 3 (status stayed `queued`, none failed).
+
 ---
-*Log: Steps 1–3 done. Next: Step 4 — per-tenant rate limiting + tests.*
+*Log: Steps 1–4 done. Next: Step 5 — Docker + Kubernetes + KEDA autoscaling on queue depth.*

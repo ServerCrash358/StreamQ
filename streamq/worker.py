@@ -23,6 +23,7 @@ from typing import Any
 from streamq.broker import Broker
 from streamq.config import get_settings
 from streamq.models import JobStatus
+from streamq.ratelimit import RateLimiter
 from streamq.registry import run_handler
 from streamq.retry import compute_backoff
 
@@ -45,8 +46,21 @@ class Worker:
         # each worker's pending messages separately.
         self.name = name or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self._sem = asyncio.Semaphore(self.s.worker_concurrency)
+        self.limiter = RateLimiter(self.redis, self.s.rate_limit_per_window, self.s.rate_limit_window_seconds)
 
     async def _process(self, msg_id: str, fields: dict[str, str]) -> None:
+        tenant = fields.get("tenant", "default")
+        # Per-tenant gate FIRST — before marking running/attempts. If the tenant
+        # is over its limit, defer (reschedule) the task; this is NOT a failure,
+        # so it doesn't consume a retry. ACK the current delivery; the scheduler
+        # re-enqueues it after the defer window.
+        if self.s.rate_limit_enabled and not await self.limiter.allow(tenant):
+            await self.broker.schedule_retry(
+                fields["job_id"], fields["task"], tenant, self.s.rate_limit_defer_seconds
+            )
+            await self.redis.xack(self.s.stream, self.s.group, msg_id)
+            return
+
         job_id = uuid.UUID(fields["job_id"])
         # Mark running + bump attempts; pull the payload (Postgres = source of truth).
         async with self.pool.acquire() as conn:

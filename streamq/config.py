@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_per_window: int = 100   # max tasks...
     rate_limit_window_seconds: float = 60.0   # ...per tenant per this window
+    # A rate-limited task is deferred (re-scheduled) this many seconds, NOT failed.
+    rate_limit_defer_seconds: float = 2.0
 
 
 @lru_cache
