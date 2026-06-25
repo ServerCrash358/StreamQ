@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     stream: str = "streamq:tasks"      # the main work stream (XADD here)
     group: str = "workers"             # consumer group all workers share
     dlq_stream: str = "streamq:dlq"    # dead-letter stream for give-ups
+    scheduled_zset: str = "streamq:scheduled"   # delayed retries, scored by ready-at time
 
     # ── consumer behaviour ───────────────────────────────────────────────
     batch_size: int = 10               # XREADGROUP COUNT

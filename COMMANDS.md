@@ -43,5 +43,32 @@ docker exec streamq-db-1 psql -U streamq -d streamq -c \
 Verified: enqueue → consumer group → asyncio worker runs handler → job marked
 'succeeded' with result in Postgres → message XACK'd (0 pending).
 
+## Step 3 — reliability (retry/backoff, DLQ, reclaim)
+
+The worker (`python -m streamq.worker`) now runs three loops concurrently:
+consume + **scheduler** (delayed retries) + **reclaimer** (crash recovery).
+
+How it behaves:
+- handler fails & attempts < max_retries → job parked in `streamq:scheduled`
+  (ZSET, scored by ready-at) with **exponential backoff + full jitter**; the
+  scheduler re-enqueues it when due.
+- attempts exhausted → job marked `dead` + pushed to `streamq:dlq`.
+- worker crashes mid-task → message stays pending → **XAUTOCLAIM** (after
+  `visibility_timeout_ms`) hands it to a live worker, which reprocesses it.
+
+Inspect:
+```bash
+docker exec streamq-db-1 psql -U streamq -d streamq -c \
+  "SELECT status, count(*) FROM jobs GROUP BY status;"
+docker exec streamq-redis-1 redis-cli XLEN streamq:dlq            # dead-letter size
+docker exec streamq-redis-1 redis-cli ZCARD streamq:scheduled     # pending retries
+docker exec streamq-redis-1 redis-cli XPENDING streamq:tasks workers   # in-flight/unacked
+```
+Verified: boom task → retried w/ backoff → attempts=3 → dead + 1 in DLQ; and an
+orphaned (pending) message → reclaimed → reprocessed → succeeded.
+
+> Note: because tasks can run more than once (retries + reclaim), **handlers
+> must be idempotent.**
+
 ---
-*Log: Steps 1–2 done. Next: Step 3 — at-least-once reclaim, retry+backoff+jitter, DLQ.*
+*Log: Steps 1–3 done. Next: Step 4 — per-tenant rate limiting + tests.*

@@ -24,6 +24,7 @@ from streamq.broker import Broker
 from streamq.config import get_settings
 from streamq.models import JobStatus
 from streamq.registry import run_handler
+from streamq.retry import compute_backoff
 
 
 def _jsonable(v: Any) -> Any:
@@ -51,7 +52,7 @@ class Worker:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = now() "
-                "WHERE id = $1 RETURNING task_name, payload",
+                "WHERE id = $1 RETURNING task_name, payload, attempts, max_retries, tenant_id",
                 job_id,
             )
         if row is None:   # job row vanished (shouldn't happen) — drop the message
@@ -59,6 +60,7 @@ class Worker:
             return
 
         task_name = row["task_name"]
+        attempts, max_retries, tenant = row["attempts"], row["max_retries"], row["tenant_id"]
         payload = row["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)
@@ -72,15 +74,27 @@ class Worker:
                     job_id, json.dumps(_jsonable(result)),
                 )
         except Exception as e:
-            # Step 3 replaces this with retry-with-backoff / dead-letter.
-            async with self.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET status = $2, last_error = $3, updated_at = now() WHERE id = $1",
-                    job_id, JobStatus.FAILED, str(e),
-                )
+            if attempts < max_retries:
+                # transient failure → schedule a delayed retry (backoff + jitter)
+                delay = compute_backoff(attempts, self.s.base_backoff_seconds, self.s.max_backoff_seconds)
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET status = $2, last_error = $3, updated_at = now() WHERE id = $1",
+                        job_id, JobStatus.FAILED, str(e),
+                    )
+                await self.broker.schedule_retry(str(job_id), task_name, tenant, delay)
+            else:
+                # out of retries → dead-letter it for inspection
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET status = $2, last_error = $3, updated_at = now() WHERE id = $1",
+                        job_id, JobStatus.DEAD, str(e),
+                    )
+                await self.broker.send_to_dlq(str(job_id), task_name, tenant, str(e))
         finally:
-            # ACK regardless in Step 2 (no redelivery yet). Step 3 will only ACK
-            # on terminal outcomes and let retries re-deliver.
+            # ACK the delivery. Terminal outcomes (succeeded/dead) are done; a
+            # retry rides a NEW message re-enqueued by the scheduler, so acking
+            # here is correct and avoids redelivery loops.
             await self.redis.xack(self.s.stream, self.s.group, msg_id)
 
     async def _guarded(self, msg_id: str, fields: dict[str, str]) -> None:
@@ -104,12 +118,17 @@ class Worker:
 async def main() -> None:
     # Importing the example tasks registers their handlers in the registry.
     from streamq import tasks_example  # noqa: F401
+    from streamq.reclaimer import Reclaimer
+    from streamq.scheduler import Scheduler
 
     broker = await Broker.create()
     worker = Worker(broker)
+    scheduler = Scheduler(broker)   # pumps delayed retries back onto the stream
+    reclaimer = Reclaimer(worker)   # recovers work orphaned by crashed workers
     print(f"worker {worker.name} consuming group '{broker.s.group}' on '{broker.s.stream}'")
     try:
-        await worker.run()
+        # consume loop + scheduler + reclaimer run concurrently in one process
+        await asyncio.gather(worker.run(), scheduler.run(), reclaimer.run())
     finally:
         await broker.close()
 
